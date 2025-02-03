@@ -1,24 +1,34 @@
 import logging
 from time import sleep
-
+from typing import Optional, Dict, Literal
 import requests
+from requests.exceptions import JSONDecodeError
 
 from .api_token import ApiToken
+
+
+class APIError(Exception):
+    def __init__(self, status_code: int, error: str, detail: str = ""):
+        self.status_code = status_code
+        self.error = error
+        self.detail = detail
+        super().__init__(f"{status_code}: {error}. {detail}".strip())
 
 
 class Api:
     NAME: str = "none"
     locale: str = "ru"
-    retries: int = 3
-    retry_delay: int = 10
+    retries: int = 5
+    retry_delay: int = 12
 
     def __init__(self, token):
         self.token: ApiToken = ApiToken(token)
-        self.__headers: dict = {
+        self.session = requests.Session()
+        self.session.headers.update({
             "Authorization": token,
             "Accept": "application/json",
             "Content-Type": "application/json",
-        }
+        })
 
     def api_name(self) -> str:
         return self.NAME
@@ -26,54 +36,83 @@ class Api:
     def api_access(self) -> bool:
         return self.token.has_scope(self.NAME)
 
-    def get(self, url: str, params: dict = {}):
-        return self.__request(url, params)
+    def get(self, url: str, params: Optional[Dict] = None):
+        return self.__request("GET", url, params)
 
-    def post(self, url: str, params: dict = {}, data: dict = {}):
-        return self.__request(url, params, data, "POST")
+    def post(self, url: str, params: Optional[Dict] = None, data: Optional[Dict] = None):
+        return self.__request("POST", url, params, json=data)
 
-    def __request(self, url: str, params: dict = {}, data: dict = {}, method: str = "GET"):
-        if method not in ("GET", "POST"):
-            raise Exception("Unknown method")
+    def __request(
+            self,
+            method: Literal["GET", "POST"],
+            url: str,
+            params: Optional[Dict] = None,
+            json: Optional[Dict] = None
+    ):
+        params = params or {}
+        json = json or {}
 
-        for retry in range(self.retries):
-            if method == "GET":
-                response = requests.get(url, params=params, headers=self.__headers)
-            elif method == "POST":
-                response = requests.post(url, params=params, json=data, headers=self.__headers)
+        for attempt in range(1, self.retries + 1):
+            response = self.session.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json
+            )
 
-            logging.info(f"URL: {response.url}")
-            logging.info(f"Attempt: {retry + 1}/{self.retries}")
+            logging.info(f"Attempt {attempt}/{self.retries} | {method} {response.url}")
 
-            if response.status_code == 429 and retry < self.retries:
-                logging.info("429: Too Many Requests")
-                logging.info(f"Repeat after {self.retry_delay} seconds.")
-                sleep(self.retry_delay)
-            else:
-                break
+            if response.status_code == 429 and attempt < self.retries:
+                delay = self.__get_retry_delay(response)
+                logging.warning(f"429 Too Many Requests. Retrying in {delay}s")
+                sleep(delay)
+                continue
 
-        self.__check_response_status(response)
-        return response.json()
+            if not response.ok:
+                self.__handle_error(response)
 
-    def __check_response_status(self, response: requests.Response):
-        if response.status_code == 200:
-            logging.info("200: OK")
-        else:
-            try:
-                response_json = response.json()
-            except Exception:
-                response_json = {
-                    "statusText": "Error decoding the json response",
-                    "detail": response.content
-                }
+            return response.json()
 
-            error = "Wildberries API Error"
-            if response.status_code == 400 and "message" in response_json: error = response_json["message"]
-            if "error" in response_json:      error = response_json["error"]["errorText"]
-            if "errors" in response_json:     error = "; ".join(response_json["errors"])
-            if "statusText" in response_json: error = response_json["statusText"]
+        raise APIError(429, "Max retries exceeded", "Too Many Requests")
 
-            detail = ""
-            if "detail" in response_json:     detail = response_json["detail"]
+    def __get_retry_delay(self, response: requests.Response) -> int:
+        retry_after = response.headers.get("X-Ratelimit-Retry", 0)
+        return int(retry_after) if retry_after else self.retry_delay
 
-            raise Exception(f"{response.status_code}: {error}. {detail}")
+    def __handle_error(self, response: requests.Response) -> None:
+        try:
+            response_json = response.json()
+        except JSONDecodeError:
+            response_json = {"message": "Invalid JSON response", "detail": response.text}
+
+        error_info = {
+            "status_code": response.status_code,
+            "error": self.__extract_error_message(response_json),
+            "detail": response_json.get("detail", "")
+        }
+
+        logging.error(f"API Error: {error_info}")
+        raise APIError(**error_info)
+
+    def __extract_error_message(self, response_json: Dict) -> str:
+        error_fields = [
+            ("message", None),
+            ("statusText", None)
+            ("errors", lambda x: "; ".join(x)),
+            ("error", "errorText"),
+        ]
+        for field, processor in error_fields:
+            if field in response_json:
+                value = response_json[field]
+                if callable(processor):
+                    return processor(value)
+                elif value is not None and value in response_json:
+                    return response_json[value]
+                return value
+        return "Unknown error"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.session.close()

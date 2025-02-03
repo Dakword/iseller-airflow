@@ -8,7 +8,7 @@ from iseller.wb.sellers import get_sellers_ids
 from iseller.wb.statistics.tasks.seller_orders import SellerOrdersTaskGroup
 from iseller.wb.wb_tasks_factory import check_seller_token_task
 from iseller.wb import Config
-from iseller.wbseller import ReturnsApi, StatisticsApi
+from iseller.wbseller import StatisticsApi
 
 DAG_NAME = "wb_statistics_orders"
 CONN_ID = Config.CONN_ID
